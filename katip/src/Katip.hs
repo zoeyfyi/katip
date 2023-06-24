@@ -121,9 +121,13 @@ module Katip
     SimpleLogPayload,
     sl,
     defaultScribeSettings,
+    ScribeExceptionBehaviour(..),
+    ScribeClosedException(..),
     ScribeSettings,
     scribeBufferSize,
     _scribeBufferSize,
+    scribeExceptionBehaviour,
+    _scribeExceptionBehaviour,
 
     -- ** @lens@-compatible Lenses
     itemApp,
