@@ -661,6 +661,7 @@ instance Monoid Scribe where
 data ScribeHandle = ScribeHandle {
       shScribe :: Scribe
     , shChan   :: BQ.TBQueue WorkerMessage
+    , shWorker :: Async.Async ()
     }
 
 
@@ -732,36 +733,64 @@ registerScribe
     -> IO LogEnv
 registerScribe nm scribe ScribeSettings {..} le = do
   queue <- atomically (BQ.newTBQueue (fromIntegral _scribeBufferSize))
-  worker <- spawnScribeWorker scribe queue
+  worker <- spawnScribeWorker scribe _scribeExceptionBehaviour queue
   let fin = do
         atomically (BQ.writeTBQueue queue PoisonPill)
         -- wait for our worker to finish final write
-        void (Async.waitCatch worker)
+        res <- Async.waitCatch worker
+        case (res, _scribeExceptionBehaviour) of
+          (Left e, Throw) -> throwIO (ScribeClosedException e)
+          _ -> return ()
+
         -- wait for scribe to finish final write
         void (scribeFinalizer scribe)
 
-  let sh = ScribeHandle (scribe { scribeFinalizer = fin }) queue
+  let sh = ScribeHandle (scribe { scribeFinalizer = fin }) queue worker
   return (le & logEnvScribes %~ M.insert nm sh)
 
 
 -------------------------------------------------------------------------------
-spawnScribeWorker :: Scribe -> BQ.TBQueue WorkerMessage -> IO (Async.Async ())
-spawnScribeWorker (Scribe write _ _) queue = Async.async go
+spawnScribeWorker :: Scribe -> ScribeExceptionBehaviour -> BQ.TBQueue WorkerMessage -> IO (Async.Async ())
+spawnScribeWorker (Scribe write _ _) eb queue = Async.async go
   where
+    write' :: forall a. LogItem a => Item a -> IO ()
+    write' = case eb of
+      Throw    -> write
+      -- Swallow any direct exceptions from the
+      -- scribe. safe-exceptions won't catch async exceptions.
+      Suppress -> void . tryAny . write
+
     go = do
       newCmd <- atomically (BQ.readTBQueue queue)
       case newCmd of
         NewItem a  -> do
-          -- Swallow any direct exceptions from the
-          -- scribe. safe-exceptions won't catch async exceptions.
-          void (tryAny (write a))
+          write' a
           go
         PoisonPill -> return ()
 
 
 -------------------------------------------------------------------------------
+-- | Exception handling behavior for scribes. 
+data ScribeExceptionBehaviour = 
+  -- | Throws a 'ScribeClosedException' exception when 
+  -- writing to or closing a scribe that has failed.
+  Throw | 
+  -- | Suppress exceptions raised in the scribe thread.
+  Suppress
+  deriving (Show, Eq)
+
+-- | Exception thrown when a logging to or closing a scribe that has failed.
+newtype ScribeClosedException e = ScribeClosedException {reason :: e}
+  deriving (Eq, Typeable)
+
+instance Exception e => Show (ScribeClosedException e) where
+  show (ScribeClosedException {..}) = "ScribeClosedException, reason: " ++ show reason
+
+instance Exception e => Exception (ScribeClosedException e)
+
 data ScribeSettings = ScribeSettings {
       _scribeBufferSize :: Int
+    , _scribeExceptionBehaviour :: ScribeExceptionBehaviour
     }
   deriving (Show, Eq)
 
@@ -771,7 +800,7 @@ makeLenses ''ScribeSettings
 -- | Reasonable defaults for a scribe. Buffer
 -- size of 4096.
 defaultScribeSettings :: ScribeSettings
-defaultScribeSettings = ScribeSettings 4096
+defaultScribeSettings = ScribeSettings 4096 Suppress
 
 
 -------------------------------------------------------------------------------
@@ -1006,6 +1035,10 @@ logKatipItem item = do
     LogEnv{..} <- getLogEnv
     liftIO $
       FT.forM_ (M.elems _logEnvScribes) $ \ ScribeHandle {..} -> do
+        status <- Async.poll shWorker
+        case status of
+          Just (Left e) -> throwIO $ ScribeClosedException e
+          _ -> return ()
         whenM (scribePermitItem shScribe item) $
           void $ atomically (tryWriteTBQueue shChan (NewItem item))
 

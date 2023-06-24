@@ -16,6 +16,8 @@ where
 -------------------------------------------------------------------------------
 import Control.Applicative as A
 import Control.Concurrent.STM
+import Control.Concurrent
+import Control.Monad.IO.Class
 import Control.Exception.Safe
 import Data.Aeson
 #if MIN_VERSION_aeson(2, 0, 0)
@@ -61,7 +63,8 @@ tests =
       logContextsTests,
       closeScribeTests,
       closeScribesTests,
-      loggingTests
+      loggingTests,
+      exceptionBehaviorTests
     ]
 
 -------------------------------------------------------------------------------
@@ -238,6 +241,59 @@ closeScribesTests =
           Left (ScribeBroken scribeNo) -> scribeNo @?= 1
           Right _ -> assertFailure "Expected to throw a ScribeBroken but it did not"
     ]
+
+-------------------------------------------------------------------------------
+throwingScribeException :: IOError
+throwingScribeException = userError "throw from scribe write"
+
+throwingScribe :: Scribe
+throwingScribe = Scribe (const (throwIO throwingScribeException)) (return ()) (permitItem DebugS)
+
+exceptionBehaviorTests :: TestTree
+exceptionBehaviorTests =
+  testGroup
+    "exceptionBehaviour"
+    [ testCase "throw an exception during close" $ do 
+        le <- registerScribe "throwing" throwingScribe (ScribeSettings 4098 Throw) =<< initLogEnv "ns" "test"
+        runKatipContextT le () "ns" $ do
+          res :: Either SomeException () <- try $ $(logTM) InfoS "basic log"
+          case res of
+            Left e -> liftIO $ assertFailure $ "Expected initial log to succeed but got: " <> show e
+            Right _ -> return ()
+        res2 :: Either SomeException LogEnv <- try $ closeScribes le
+        case res2 of
+          Left e -> assertEqual "Expected write error to be thrown" (show $ ScribeClosedException $ throwingScribeException) (show e)
+          Right _ -> assertFailure "Expected close to throw an exception"
+    , testCase "throw an exception during logging" $ do
+        le <- registerScribe "throwing" throwingScribe (ScribeSettings 4098 Throw) =<< initLogEnv "ns" "test"
+        runKatipContextT le () "ns" $ do
+          res :: Either SomeException () <- try $ $(logTM) InfoS "basic log"
+          case res of
+            Left e -> liftIO $ assertFailure $ "Expected initial log to succeed but got: " <> show e
+            Right _ -> return ()
+          liftIO $ threadDelay (10 * 1000) -- wait 10ms for scribe to process buffer
+          res2 :: Either SomeException () <- try $ $(logTM) InfoS "second log"
+          case res2 of
+            Left e -> liftIO $ assertEqual "Expected write error to be thrown" (show $ ScribeClosedException $ throwingScribeException) (show e)
+            Right _ -> liftIO $ assertFailure "Expected second log to throw an exception"  
+    , testCase "suppress exceptions during logging and close" $ do 
+        le <- registerScribe "throwing" throwingScribe (ScribeSettings 4098 Suppress) =<< initLogEnv "ns" "test"
+        runKatipContextT le () "ns" $ do
+          res :: Either SomeException () <- try $ $(logTM) InfoS "basic log"
+          case res of
+            Left e -> liftIO $ assertFailure $ "Expected initial log to succeed but got: " <> show e
+            Right _ -> return ()
+          liftIO $ threadDelay (10 * 1000) -- wait 10ms for scribe to process buffer
+          res2 :: Either SomeException () <- try $ $(logTM) InfoS "second log"
+          case res2 of
+            Left e -> liftIO $ assertFailure $ "Expected second log to succeed but got: " <> show e
+            Right _ -> return ()
+        res3 :: Either SomeException LogEnv <- try $ closeScribes le
+        case res3 of
+          Left e -> liftIO $ assertFailure $ "Expected close to succeed but got: " <> show e
+          Right _ -> return ()
+    ]
+
 
 -------------------------------------------------------------------------------
 data ConservativePayload = ConservativePayload
